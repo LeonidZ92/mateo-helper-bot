@@ -31,6 +31,7 @@ class NotifyStates(StatesGroup):
 
 class ReportStates(StatesGroup):
     writing = State()  # пользователь вводит текст отчёта
+    choosing_action = State()  # добавить или заменить
 
 # --- DB helpers ---
 
@@ -130,6 +131,22 @@ async def get_reports(user_id: int, days: int):
         """, (user_id, f'-{days} days')) as cur:
             return await cur.fetchall()
 
+async def get_today_report(user_id: int, date: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM reports WHERE user_id = ? AND date = ?",
+            (user_id, date)
+        ) as cur:
+            return await cur.fetchone()
+
+async def replace_report(user_id: int, date: str, text: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE reports SET text = ? WHERE user_id = ? AND date = ?",
+            (text, user_id, date)
+        )
+        await db.commit()
+
 def all_days_off(last_date, today, work_days_list):
     current = last_date + timedelta(days=1)
     while current < today:
@@ -160,6 +177,13 @@ REPORT_KB = types.InlineKeyboardMarkup(
     inline_keyboard=[
         [types.InlineKeyboardButton(text="✏️ Записать отчёт", callback_data="report_write")],
         [types.InlineKeyboardButton(text="📖 Посмотреть отчёт", callback_data="report_view")],
+    ]
+)
+
+REPORT_ACTION_KB = types.InlineKeyboardMarkup(
+    inline_keyboard=[
+        [types.InlineKeyboardButton(text="➕ Добавить", callback_data="report_add")],
+        [types.InlineKeyboardButton(text="🔄 Заменить", callback_data="report_replace")],
     ]
 )
 
@@ -341,8 +365,28 @@ async def report_save(message: types.Message, state: FSMContext):
     # 1. сохранить текст в reports через save_report
     user_id = message.from_user.id
     today = datetime.now().date()
-    await save_report(user_id, str(today), message.text)
+    existing = await get_today_report(user_id, str(today))
+    data = await state.get_data()
+    action = data.get("report_action")
+
+    if existing and action is None:
+        # первый раз — спрашиваем что делать
+        await message.answer("Ты уже писал отчёт сегодня. Что хочешь сделать?",
+                             reply_markup=REPORT_ACTION_KB)
+        await state.update_data(report_text=message.text)  # сохраняем текст
+        await state.set_state(ReportStates.choosing_action)
+        return
+    elif action == "report_replace":
+        await replace_report(user_id, str(today), message.text)
+    elif action == "report_add":
+        await save_report(user_id, str(today), message.text)
+    else:
+        await save_report(user_id, str(today), message.text)  # первая запись за день
     # 2. обновить streak (логика из старого worked)
+    if action in ["report_replace", "report_add"]:
+        await message.answer("📝 Отчёт обновлён!")
+        await state.clear()
+        return
     user = await get_user(user_id)
     if not user:
         await upsert_user(user_id, 0, None)
@@ -376,6 +420,16 @@ async def report_save(message: types.Message, state: FSMContext):
     await message.answer(f"📝 Отчёт сохранён! 🔥 Серия: {streak} дней подряд!")
     # 4. state.clear()
     await state.clear()
+
+@dp.callback_query(lambda c: c.data in ["report_add", "report_replace"])
+async def report_action(callback: types.CallbackQuery, state: FSMContext):
+    # 1. сохрани выбор пользователя в state
+    await state.update_data(report_action=callback.data)
+    # 2. попроси написать текст
+    await callback.message.answer("Напиши текст отчёта:")
+    await callback.answer()
+    # 3. переключи состояние обратно на writing
+    await state.set_state(ReportStates.writing)
 
 @dp.callback_query(lambda c: c.data == "report_view")
 async def report_view(callback: types.CallbackQuery):
