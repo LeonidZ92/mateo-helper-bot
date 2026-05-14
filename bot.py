@@ -1,13 +1,17 @@
+import aiosqlite
 import asyncio
-import os
 import logging
+import os
+import pytz
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import aiosqlite
+
+
 
 # 🔐 Токен из переменной окружения
 
@@ -33,6 +37,9 @@ class ReportStates(StatesGroup):
     writing = State()  # пользователь вводит текст отчёта
     choosing_action = State()  # добавить или заменить
 
+class OnboardingStates(StatesGroup):
+    entering_streak_name = State() # пользователь вводит название серии
+
 # --- DB helpers ---
 
 async def init_db():
@@ -48,6 +55,8 @@ async def init_db():
         for column, definition in [
             ("notify_days", "TEXT"),
             ("notify_time", "TEXT"),
+            ("streak_name", "TEXT"),
+            ("timezone", "TEXT")
         ]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
@@ -68,7 +77,7 @@ async def init_db():
 async def get_user(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT streak, last_date, notify_days FROM users WHERE user_id = ?", (user_id,)
+            "SELECT streak, last_date, notify_days, notify_time, streak_name, timezone FROM users WHERE user_id = ?", (user_id,)
         ) as cur:
             return await cur.fetchone()
 
@@ -76,35 +85,44 @@ async def upsert_user(user_id: int,
                       streak: int,
                       last_date: str | None,
                       notify_days: str | None = None,
-                      notify_time: str | None = None
+                      notify_time: str | None = None,
+                      streak_name: str | None = None,
+                      timezone: str | None = None
                       ):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-            INSERT INTO users (user_id, streak, last_date, notify_days, notify_time)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO users (user_id, streak, last_date, notify_days, notify_time, streak_name, timezone)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET streak = excluded.streak,
                                                last_date = excluded.last_date,
                                                notify_days = excluded.notify_days,
-                                               notify_time = excluded.notify_time
-        """, (user_id, streak, last_date, notify_days, notify_time))
+                                               notify_time = excluded.notify_time,
+                                               streak_name = excluded.streak_name,
+                                               timezone = excluded.timezone
+        """, (user_id, streak, last_date, notify_days, notify_time, streak_name, timezone))
         await db.commit()
 
-async def check_and_notify():
-    now = datetime.now()
-    current_day = now.isoweekday()
-    current_time = now.strftime("%H:%M")
 
-# 1. достань всех пользователей у которых настроены уведомления
+async def check_and_notify():
+    now = datetime.now(pytz.utc)  # UTC время
+
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""SELECT user_id, notify_days, notify_time FROM users
-                WHERE notify_days IS NOT NULL AND notify_time IS NOT NULL""") as cur:
+        async with db.execute("""
+            SELECT user_id, notify_days, notify_time, timezone FROM users
+            WHERE notify_days IS NOT NULL AND notify_time IS NOT NULL
+        """) as cur:
             users = await cur.fetchall()
-# 2. для каждого пользователя проверь совпадение дней и времени:
+
         for row in users:
-            user_id, notify_days, notify_time = row  # распаковка строки БД
+            user_id, notify_days, notify_time, timezone = row
+
+            # конвертируем UTC в timezone пользователя
+            tz = pytz.timezone(timezone or "UTC")
+            user_time = now.astimezone(tz)
+            current_time = user_time.strftime("%H:%M")
+            current_day = user_time.isoweekday()
 
             notify_days_list = [int(d) for d in notify_days.split(",")]
-# 3. если оба условия True — отправь сообщение
             if current_time == notify_time and current_day in notify_days_list:
                 await bot.send_message(user_id, "Пришло время позаниматься! 💪")
 
@@ -147,14 +165,6 @@ async def replace_report(user_id: int, date: str, text: str):
         )
         await db.commit()
 
-def all_days_off(last_date, today, work_days_list):
-    current = last_date + timedelta(days=1)
-    while current < today:
-        if current.isoweekday() in work_days_list:
-            return False  # нашли рабочий день — streak сбрасывается
-        current += timedelta(days=1)
-    return True  # все пропущенные дни нерабочие
-
 # --- Keyboard ---
 
 MAIN_KB = types.ReplyKeyboardMarkup(
@@ -177,6 +187,7 @@ REPORT_KB = types.InlineKeyboardMarkup(
     inline_keyboard=[
         [types.InlineKeyboardButton(text="✏️ Записать отчёт", callback_data="report_write")],
         [types.InlineKeyboardButton(text="📖 Посмотреть отчёт", callback_data="report_view")],
+        [types.InlineKeyboardButton(text="🔄 Переименовать серию", callback_data="rename_streak")],
     ]
 )
 
@@ -193,6 +204,13 @@ CONFIRM_KB = types.InlineKeyboardMarkup(
             types.InlineKeyboardButton(text="✅ Да", callback_data="reset_confirm"),
             types.InlineKeyboardButton(text="❌ Нет", callback_data="reset_cancel"),
         ]
+    ]
+)
+
+NOTIFY_MANAGE_KB = types.InlineKeyboardMarkup(
+    inline_keyboard=[
+        [types.InlineKeyboardButton(text="✏️ Изменить", callback_data="notify_edit")],
+        [types.InlineKeyboardButton(text="🗑 Удалить", callback_data="notify_delete")],
     ]
 )
 
@@ -225,6 +243,12 @@ PERIOD_KB = types.InlineKeyboardMarkup(
     ]
 )
 
+GEO_KB = types.ReplyKeyboardMarkup(
+    keyboard=[[types.KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
 # --- Dictionary ---
 DAY_NAMES = {1: "Пн", 2: "Вт", 3: "Ср", 4: "Чт", 5: "Пт", 6: "Сб", 7: "Вс"}
 
@@ -239,9 +263,13 @@ async def cmd_start(message: types.Message):
         await upsert_user(user_id, streak=0, last_date=None)
 
     await message.answer(
-        "Привет! Я буду напоминать тебе каждый день заниматься.\n\n"
-        "Нажми, когда поработаешь 👇",
+        "Привет! Я помогу тебе отслеживать рабочие привычки 👋\n\n"
+        "📊 *Статистика* — текущая серия дней твоего проекта\n"
+        "📝 *Отчёт* — записывай что сделал, смотри историю\n"
+        "🔔 *Напоминания* — выбери дни и время уведомлений\n\n"
+        "Начнём? 👇",
         reply_markup=MAIN_KB,
+        parse_mode="Markdown"
     )
 
 @dp.message(lambda m: m.text == "📊 Статистика")
@@ -254,14 +282,55 @@ async def menu_report(message: types.Message):
 
 @dp.message(lambda m: m.text == "🔔 Напоминания")
 async def notify_button(message: types.Message, state: FSMContext):
-    await state.set_state(NotifyStates.choosing_days)  # устанавливаем состояние
-    await message.answer("Выбери дни для уведомлений:", reply_markup=DAYS_KB)
+    user = await get_user(message.from_user.id)
+    notify_days = user[2] if user else None
+    notify_time = user[3] if user else None
+    timezone = user[5] if user else None
+
+    if not timezone:
+        await message.answer(
+            "Чтобы уведомления приходили в правильное время,\n"
+            "мне нужно узнать твой часовой пояс 🌍\n\n"
+            "Нажми кнопку ниже — я определю его автоматически\n"
+            "по твоей геолокации. Данные используются только\n"
+            "для настройки времени и нигде не сохраняются.",
+            reply_markup=GEO_KB
+        )
+        return
+    if notify_days and notify_time:
+        days_names = [DAY_NAMES[int(d)] for d in notify_days.split(",")]
+        days_str = ", ".join(days_names)
+        await message.answer(
+            f"🔔 Текущее расписание:\n\n📅 Дни: {days_str}\n\n⏰ Время: {notify_time}",
+            reply_markup=NOTIFY_MANAGE_KB
+        )
+    else:
+        await state.set_state(NotifyStates.choosing_days)
+        await message.answer("Выбери дни для уведомлений:", reply_markup=DAYS_KB)
+
+@dp.callback_query(lambda c: c.data == "notify_edit")
+async def notify_edit(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(NotifyStates.choosing_days)
+    await callback.message.answer("Выбери дни для уведомлений:", reply_markup=DAYS_KB)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "notify_delete")
+async def notify_delete(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user = await get_user(user_id)
+    streak = user[0] if user else 0
+    last_date = user[1] if user else None
+    streak_name = user[4] if user and user[4] else "Серия"
+    await upsert_user(user_id, streak, last_date, None, None, streak_name)
+    await callback.message.answer("🗑 Расписание уведомлений удалено", reply_markup=MAIN_KB)
+    await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "stats")
 async def stats(callback: types.CallbackQuery):
     user = await get_user(callback.from_user.id)
     streak = user[0] if user else 0
-    await callback.message.answer(f"🔥 Текущая серия: {streak} дней")
+    streak_name = user[4] if user and user[4] else "Серия"
+    await callback.message.answer(f"🔥 {streak_name}: {streak} дней")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "reset")
@@ -279,7 +348,8 @@ async def reset_confirm(callback: types.CallbackQuery, state: FSMContext):
     user = await get_user(user_id)
     streak = user[0]
     if callback.data == "reset_confirm":
-        await upsert_user(user_id, 0, None)
+        await upsert_user(user_id, 0, None,
+                          notify_days=user[2], notify_time=user[3], streak_name=user[4], timezone=user[5])
         await callback.message.answer("Серия сброшена. Начинай заново! 💪", reply_markup=MAIN_KB)
     else:
         await callback.message.answer(f"Отмена сброса 😌 Твоя серия: {streak} дней",
@@ -345,20 +415,29 @@ async def handle_time(message: types.Message, state: FSMContext):
     last_date = user[1] if user else None
     notify_days = ",".join(str(d) for d in days)
     notify_time = message.text
-    await upsert_user(user_id, streak, last_date, notify_days, notify_time)
+    streak_name = user[4] if user and user[4] else "Серия"
+    timezone = user[5] if user else None
+    await upsert_user(user_id, streak, last_date, notify_days, notify_time, streak_name, timezone)
     # 4. ответь пользователю что настройки сохранены
     days_names = [DAY_NAMES[d] for d in days]
     days_str = ", ".join(days_names)
-    await message.answer(f"✅ Расписание сохранено!\n\n📅 Дни: {days_str}\n\n⏰ Время: {notify_time}")
+    await message.answer(f"✅ Расписание сохранено!\n\n📅 Дни: {days_str}\n\n⏰ Время: {notify_time}", reply_markup=MAIN_KB)
     # 5. state.clear()
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "report_write")
 async def report_write(callback: types.CallbackQuery, state: FSMContext):
-    # спросить "что сделал?" и установить состояние ReportStates.writing
-    await callback.message.answer("Напиши, что получилось выполнить сегодня?")
-    await callback.answer()
-    await state.set_state(ReportStates.writing)
+    user = await get_user(callback.from_user.id)
+    streak_name = user[4] if user else None
+
+    if not streak_name:
+        await callback.message.answer("Как назовём твою серию? Например: 'Читаю каждый день'")
+        await callback.answer()
+        await state.set_state(OnboardingStates.entering_streak_name)
+    else:
+        await callback.message.answer("Напиши, что получилось выполнить сегодня?")
+        await callback.answer()
+        await state.set_state(ReportStates.writing)
 
 @dp.message(ReportStates.writing)
 async def report_save(message: types.Message, state: FSMContext):
@@ -390,34 +469,15 @@ async def report_save(message: types.Message, state: FSMContext):
     user = await get_user(user_id)
     if not user:
         await upsert_user(user_id, 0, None)
-        user = (0, None, None)
+        user = (0, None, None, None, None, None)  # ✅ шесть значений
 
-    streak, last_date, notify_days = user
+    streak, last_date, notify_days, notify_time, streak_name, timezone = user
 
-    if last_date:
-        last_date_obj = datetime.strptime(last_date, "%Y-%m-%d").date()
-        diff = (today - last_date_obj).days
-
-        if diff == 0:
-            await message.answer(f"Ты уже отмечал сегодня 😉 Серия: {streak} дней")
-            await state.clear()
-            return
-        elif diff == 1:
-            streak += 1
-        else:
-            if notify_days:
-                work_days_list = [int(d) for d in notify_days.split(",")]
-                if all_days_off(last_date_obj, today, work_days_list):
-                    streak += 1  # пропущены только выходные — продолжаем серию
-                else:
-                    streak = 1  # был пропущен рабочий день — сброс
-            else:
-                streak = 1
-    else:
-        streak = 1
+    streak += 1
     # 3. ответить пользователю
-    await upsert_user(user_id, streak, str(today))
-    await message.answer(f"📝 Отчёт сохранён! 🔥 Серия: {streak} дней подряд!")
+    await upsert_user(user_id, streak, str(today),
+                      notify_days=notify_days, notify_time=notify_time, streak_name=streak_name, timezone=timezone)
+    await message.answer(f"📝 Отчёт сохранён! 🔥 {streak_name}: {streak} дней!")
     # 4. state.clear()
     await state.clear()
 
@@ -455,6 +515,65 @@ async def report_period(callback: types.CallbackQuery):
         result = "\n\n".join(lines)
         await callback.message.answer(result)
     await callback.answer()
+
+@dp.message(OnboardingStates.entering_streak_name)
+async def save_streak_name(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    streak_name = message.text
+    streak = user[0] if user else 0
+    last_date = user[1] if user else None
+    notify_days = user[2] if user else None
+    notify_time = user[3] if user else None
+    timezone = user[5] if user else None
+    await upsert_user(user_id, streak, last_date,
+                      notify_days=notify_days, notify_time=notify_time,
+                      streak_name=streak_name, timezone=timezone)
+
+    data = await state.get_data()
+    if data.get("rename_only"):
+        await message.answer(f"✅ Серия переименована: {streak_name}!", reply_markup=MAIN_KB)
+        await state.clear()
+    else:
+        await message.answer("Напиши, что получилось выполнить сегодня?")
+        await state.set_state(ReportStates.writing)
+
+@dp.callback_query(lambda c: c.data == "rename_streak")
+async def rename_streak(callback: types.CallbackQuery, state: FSMContext):
+    user = await get_user(callback.from_user.id)
+    streak_name = user[4] if user and user[4] else "Серия"
+    await callback.message.answer(f"Текущее название: {streak_name}\n\nКак переименуем?")
+    await callback.answer()
+    await state.update_data(rename_only=True)  # ← флаг что это переименование
+    await state.set_state(OnboardingStates.entering_streak_name)
+
+
+@dp.message(lambda m: m.location is not None)
+async def handle_location(message: types.Message, state: FSMContext):
+    from timezonefinder import TimezoneFinder
+
+    lat = message.location.latitude
+    lon = message.location.longitude
+
+    tf = TimezoneFinder()
+    timezone = tf.timezone_at(lat=lat, lng=lon)  # например "Europe/Moscow"
+
+    # сохрани timezone в БД
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    # достань текущие значения и сохрани с timezone
+    streak = user[0] if user else 0
+    last_date = user[1] if user else None
+    notify_days = user[2] if user else None
+    notify_time = user[3] if user else None
+    streak_name = user[4] if user and user[4] else "Серия"
+    await upsert_user(user_id, streak, last_date, notify_days, notify_time, streak_name, timezone)
+
+    await message.answer(
+        f"✅ Часовой пояс определён: {timezone}\n\nТеперь выбери дни для уведомлений:",
+        reply_markup=DAYS_KB
+    )
+    await state.set_state(NotifyStates.choosing_days)
 
 # --- Entry point ---
 
